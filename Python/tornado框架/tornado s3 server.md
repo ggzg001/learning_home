@@ -1,0 +1,294 @@
+# tornado s3server的说明
+
+Implementation of an S3-like storage server based on local files.
+
+Useful to test features that will eventually run on S3, or if you want to
+run something locally that was once running on S3.
+
+We don't support all the features of S3, but it does work with the
+standard S3 client for the most basic semantics.
+
+# 使用
+
+```python
+def start(port, root_directory="/tmp/s3", bucket_depth=0):
+    """Starts the mock S3 server on the given port at the given path."""
+    application = S3Application(root_directory, bucket_depth)
+    http_server = httpserver.HTTPServer(application)
+    http_server.listen(port)
+    ioloop.IOLoop.instance().start()
+```
+
+# S3Application
+
+```python
+class S3Application(web.Application):
+    """Implementation of an S3-like storage server based on local files.
+
+    If bucket depth is given, we break files up into multiple directories
+    to prevent hitting file system limits for number of files in each
+    directories. 1 means one level of directories, 2 means 2, etc.
+    """
+    def __init__(self, root_directory, bucket_depth=0):
+        web.Application.__init__(self, [
+            (r"/", RootHandler),
+            (r"/([^/]+)/(.+)", ObjectHandler),
+            (r"/([^/]+)/", BucketHandler),
+        ])
+        # 使用 abspath 绝对化一下路径然后再创建目录
+        self.directory = os.path.abspath(root_directory)
+        if not os.path.exists(self.directory):
+            os.makedirs(self.directory)
+        self.bucket_depth = bucket_depth
+```
+
+# BaseRequestHandler
+
+```python
+class BaseRequestHandler(web.RequestHandler):
+    SUPPORTED_METHODS = ("PUT", "GET", "DELETE")
+
+    def render_xml(self, value):
+        assert isinstance(value, dict) and len(value) == 1
+        # 设置响应头的内容类型Content-Type
+        self.set_header("Content-Type", "application/xml; charset=UTF-8")
+        name = value.keys()[0]
+        parts = []
+        parts.append('<' + escape.utf8(name) +
+                     ' xmlns="http://doc.s3.amazonaws.com/2006-03-01">')
+        # render_xml是给外部调用的, _render_parts 是内部使用的, 这里把parts这个列表对象传入，方便递归(用的是同一个对象)
+        self._render_parts(value.values()[0], parts)
+        parts.append('</' + escape.utf8(name) + '>')
+        self.finish('<?xml version="1.0" encoding="UTF-8"?>\n' +
+                    ''.join(parts))
+
+    def _render_parts(self, value, parts=[]):
+        if isinstance(value, basestring):
+            parts.append(escape.xhtml_escape(value))
+        elif isinstance(value, int) or isinstance(value, long):
+            parts.append(str(value))
+        elif isinstance(value, datetime.datetime):
+            parts.append(value.strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+        elif isinstance(value, dict):
+            for name, subvalue in value.iteritems():
+                # 把非列表转为列表
+                if not isinstance(subvalue, list):
+                    subvalue = [subvalue]
+                for subsubvalue in subvalue:
+                    parts.append('<' + escape.utf8(name) + '>')
+                    self._render_parts(subsubvalue, parts)
+                    parts.append('</' + escape.utf8(name) + '>')
+        else:
+            raise Exception("Unknown S3 value type %r", value)
+
+    def _object_path(self, bucket, object_name):
+        if self.application.bucket_depth < 1:
+            return os.path.abspath(os.path.join(
+                self.application.directory, bucket, object_name))
+        hash = hashlib.md5(object_name).hexdigest()
+        path = os.path.abspath(os.path.join(
+            self.application.directory, bucket))
+        for i in range(self.application.bucket_depth):
+            path = os.path.join(path, hash[:2 * (i + 1)])
+        return os.path.join(path, object_name)
+```
+
+# RootHandler
+
+```python
+class RootHandler(BaseRequestHandler):
+    # 得到根目录下的目录结构
+    def get(self):
+        # listdir 列表当前目录下的所有文件和目录,得到的是简单的字符串，需要adspath处理
+        names = os.listdir(self.application.directory)
+        buckets = []
+        for name in names:
+            # 这里os.path.join 的 self.application.directory 本身就是觉得路径了
+            path = os.path.join(self.application.directory, name)
+            info = os.stat(path)
+            buckets.append({
+                "Name": name,
+                # 时间转换
+                "CreationDate": datetime.datetime.utcfromtimestamp(
+                    info.st_ctime),
+            })
+        self.render_xml({"ListAllMyBucketsResult": {
+            "Buckets": {"Bucket": buckets},
+        }})
+```
+
+访问http://127.0.0.1:8888 对应这个handle
+
+```xml
+<ListAllMyBucketsResult xmlns="http://doc.s3.amazonaws.com/2006-03-01">
+<Buckets>
+<Bucket>
+<CreationDate>2019-05-21T07:12:20.000Z</CreationDate>
+<Name>a</Name>
+</Bucket>
+<Bucket>
+<CreationDate>2019-05-21T07:03:06.000Z</CreationDate>
+<Name>b</Name>
+</Bucket>
+</Buckets>
+</ListAllMyBucketsResult>
+```
+
+# BucketHandler
+
+```python
+class BucketHandler(BaseRequestHandler):
+    # 对bucket的相关操作
+    def get(self, bucket_name):
+        prefix = self.get_argument("prefix", u"")
+        marker = self.get_argument("marker", u"")
+        max_keys = int(self.get_argument("max-keys", 50000))
+        path = os.path.abspath(os.path.join(self.application.directory,
+                                            bucket_name))
+        terse = int(self.get_argument("terse", 0))
+        if not path.startswith(self.application.directory) or \
+           not os.path.isdir(path):
+            raise web.HTTPError(404)
+        object_names = []
+        for root, dirs, files in os.walk(path):
+            for file_name in files:
+                object_names.append(os.path.join(root, file_name))
+        skip = len(path) + 1
+        for i in range(self.application.bucket_depth):
+            skip += 2 * (i + 1) + 1
+        object_names = [n[skip:] for n in object_names]
+        object_names.sort()
+        contents = []
+
+        start_pos = 0
+        if marker:
+            start_pos = bisect.bisect_right(object_names, marker, start_pos)
+        if prefix:
+            start_pos = bisect.bisect_left(object_names, prefix, start_pos)
+
+        truncated = False
+        for object_name in object_names[start_pos:]:
+            if not object_name.startswith(prefix):
+                break
+            if len(contents) >= max_keys:
+                truncated = True
+                break
+            object_path = self._object_path(bucket_name, object_name)
+            c = {"Key": object_name}
+            if not terse:
+                info = os.stat(object_path)
+                c.update({
+                    "LastModified": datetime.datetime.utcfromtimestamp(
+                        info.st_mtime),
+                    "Size": info.st_size,
+                })
+            contents.append(c)
+            marker = object_name
+        self.render_xml({"ListBucketResult": {
+            "Name": bucket_name,
+            "Prefix": prefix,
+            "Marker": marker,
+            "MaxKeys": max_keys,
+            "IsTruncated": truncated,
+            "Contents": contents,
+        }})
+
+    def put(self, bucket_name):
+        # 增加一个bucket
+        path = os.path.abspath(os.path.join(
+            self.application.directory, bucket_name))
+        if not path.startswith(self.application.directory) or \
+           os.path.exists(path):
+            raise web.HTTPError(403)
+        # 创建路径
+        os.makedirs(path)
+        self.finish()
+
+    def delete(self, bucket_name):
+        # 删除目录
+        path = os.path.abspath(os.path.join(
+            self.application.directory, bucket_name))
+        if not path.startswith(self.application.directory) or \
+           not os.path.isdir(path):
+            raise web.HTTPError(404)
+        if len(os.listdir(path)) > 0:
+            raise web.HTTPError(403)
+        # 删除目录
+        os.rmdir(path)
+        self.set_status(204)
+        self.finish()
+```
+
+访问<http://127.0.0.1:8888/a/>
+
+```xml
+<ListBucketResult xmlns="http://doc.s3.amazonaws.com/2006-03-01">
+<Name>a</Name>
+<MaxKeys>50000</MaxKeys>
+<Prefix/>
+<Marker>a.txt</Marker>
+<IsTruncated>False</IsTruncated>
+<Contents>
+<LastModified>2019-05-21T07:12:12.000Z</LastModified>
+<Key>a.txt</Key>
+<Size>6</Size>
+</Contents>
+</ListBucketResult>
+```
+
+# ObjectHandler
+
+响应头：Last-Modified 是？
+
+```python
+class ObjectHandler(BaseRequestHandler):
+    # 对对象的操作
+    def get(self, bucket, object_name):
+        # url 解码
+        object_name = urllib.unquote(object_name)
+        path = self._object_path(bucket, object_name)
+        if not path.startswith(self.application.directory) or \
+           not os.path.isfile(path):
+            raise web.HTTPError(404)
+        info = os.stat(path)
+        self.set_header("Content-Type", "application/unknown")
+        self.set_header("Last-Modified", datetime.datetime.utcfromtimestamp(
+            info.st_mtime))
+        object_file = open(path, "r")
+        try:
+            self.finish(object_file.read())
+        finally:
+            object_file.close()
+
+    def put(self, bucket, object_name):
+        object_name = urllib.unquote(object_name)
+        bucket_dir = os.path.abspath(os.path.join(
+            self.application.directory, bucket))
+        if not bucket_dir.startswith(self.application.directory) or \
+           not os.path.isdir(bucket_dir):
+            raise web.HTTPError(404)
+        path = self._object_path(bucket, object_name)
+        if not path.startswith(bucket_dir) or os.path.isdir(path):
+            raise web.HTTPError(403)
+        directory = os.path.dirname(path)
+        # 如果上传的bucket还不存在的话，就创建这个bucket目录
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+        object_file = open(path, "w")
+        object_file.write(self.request.body)
+        object_file.close()
+        self.finish()
+
+    def delete(self, bucket, object_name):
+        # 删除bucket的object_name
+        object_name = urllib.unquote(object_name)
+        path = self._object_path(bucket, object_name)
+        if not path.startswith(self.application.directory) or \
+           not os.path.isfile(path):
+            raise web.HTTPError(404)
+        # os.unlink() 方法用于删除文件,如果文件是一个目录则返回一个错误
+        os.unlink(path)
+        self.set_status(204)
+        self.finish()
+```
+
